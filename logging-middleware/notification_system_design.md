@@ -354,3 +354,54 @@ SELECT COUNT(*) AS unread_count
 FROM notifications
 WHERE user_id = $1 AND is_read = FALSE;
 ```
+----------------------------------------------------------------------------------------------------
+STAGE3
+## Stage 3
+
+### Is the query accurate?
+
+The query itself is logically correct — it does fetch unread notifications for a specific student, ordered oldest-first. But "accurate" cuts both ways here: it returns the right rows, but `SELECT *` is a bad habit — it pulls every column (including ones the API response doesn't need, like `metadata`), wasting bandwidth and memory for no reason. So: logically correct, but not well-written.
+
+### Why is it slow?
+
+At 5,000,000 rows, without the right index, the database has no fast way to jump straight to "this student's unread notifications." It has to **scan the entire table** (or a large chunk of it) row by row, checking `studentID = 1042 AND isRead = false` on every single row, then sort whatever matches by `createdAt`. This is called a *full table scan* — and it gets linearly worse as the table grows. At 5,000 rows it's instant; at 5,000,000 it's slow, and at 50,000,000 it'll be unusable.
+
+### What would you change? What's the likely computation cost?
+
+**Change 1 — add a composite index** on `(studentID, isRead, createdAt)`. This lets the database jump directly to that student's unread rows, already roughly in the right order, instead of scanning everything.
+
+**Change 2 — select only needed columns**, not `SELECT *`:
+```sql
+SELECT id, title, message, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+**Computation cost, before vs after:**
+- Without index: **O(n)** — cost grows linearly with total table size (n = total notifications, currently 5,000,000), regardless of how few rows actually match.
+- With the right composite index: **O(log n + k)** — the database does a fast lookup (`log n`) to find the starting point, then reads only the `k` matching rows for that student. Since each student typically has a small, bounded number of notifications, this stays fast even as the *total* table grows into the tens of millions.
+
+### Is "add indexes on every column" good advice?
+
+**No — and this is the trap question.** Indexes aren't free:
+- **Every index slows down writes.** Every `INSERT`/`UPDATE`/`DELETE` has to update every index on that table too. With 5,000,000+ rows and indexes on every column, write performance would degrade badly — and this is a write-heavy table (new notifications constantly being created).
+- **Indexes cost storage.** An index roughly duplicates the indexed column's data in a separate structure. Indexing every column could mean storage costs rivaling or exceeding the table itself.
+- **Most single-column indexes won't even get used.** The database query planner picks *one* index per query (in simple cases) — having ten unrelated single-column indexes when your actual query always filters on `studentID + isRead` together does nothing for that query. What helps is a **composite index that matches your actual query patterns**, not blanket indexing.
+
+The right approach: index based on how the table is actually queried — in this case, `(studentID, isRead, createdAt)` — not indiscriminately.
+
+### Query: students who got a "Placement" notification in the last 7 days
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notification_type = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+
+- `DISTINCT studentID` — since the question asks for which students, not every matching notification row (a student could have multiple placement notifications in that window)
+- `notification_type = 'Placement'` — filters to the specific enum value
+- `createdAt >= NOW() - INTERVAL '7 days'` — last 7 days, relative to now
+
+This query would benefit from a separate composite index: `(notification_type, createdAt)`.
